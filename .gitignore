@@ -16,3 +16,7 @@
 
 # Emacs
 *~
+
+/tools/*
+dracu
+dracu-*-linux-amd64.tar.gz

@@ -1,3 +1,5 @@
+DRACU_VER = ENV['dracu_ver'] || '0.0.0'
+
 GO_VER = '1.18.3'
 
 TOOLS_DIR = File.expand_path('tools')
@@ -16,10 +18,15 @@ end
 
 task :build => [GO] do
   Dir.chdir('src') do
-    sh "#{GO} build -v"
+    sh "#{GO} build -v -race"
+    sh "mv dracu .."
   end
 end
 
 task :helloworld => :build do
-  sh "src/dracu ubuntu echo 'hello world'"
+  sh "dracu ubuntu echo 'hello world'"
+end
+
+task :package => :build do
+  sh "tar -zcvf dracu-v#{DRACU_VER}-linux-amd64.tar.gz LICENSE README.md dracu"
 end
