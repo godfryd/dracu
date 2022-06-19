@@ -1,4 +1,4 @@
-DRACU_VER = ENV['dracu_ver'] || '0.0.0'
+DRACU_VER = ENV['dracu_ver'] || 'v0.0.0'
 
 GO_VER = '1.18.3'
 
@@ -28,5 +28,5 @@ task :helloworld => :build do
 end
 
 task :package => :build do
-  sh "tar -zcvf dracu-v#{DRACU_VER}-linux-amd64.tar.gz LICENSE README.md dracu"
+  sh "tar -zcvf dracu-#{DRACU_VER}-linux-amd64.tar.gz LICENSE README.md dracu"
 end
