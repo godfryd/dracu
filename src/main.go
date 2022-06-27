@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 
 	"github.com/urfave/cli/v2"
 
@@ -26,7 +27,11 @@ func runContainer(imageName string, command []string, user *user.User, homeDir, 
 		panic(err)
 	}
 
-	reader, err := cli.ImagePull(ctx, "docker.io/library/"+imageName, types.ImagePullOptions{})
+	if !strings.Contains(imageName, "/") {
+		imageName = "docker.io/library/" + imageName
+	}
+
+	reader, err := cli.ImagePull(ctx, imageName, types.ImagePullOptions{})
 	if err != nil {
 		panic(err)
 	}
