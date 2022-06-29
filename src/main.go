@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	//"io/ioutil"
 	"log"
 	"os"
 	"os/user"
@@ -20,6 +23,34 @@ import (
 	"github.com/docker/docker/pkg/stdcopy"
 )
 
+type authCfg struct {
+	Auth          string `json:"auth"`
+	Email         string `json:"email"`
+	IdentityToken string `json:"identitytoken"`
+	RegistryToken string `json:"registrytoken"`
+}
+
+func parseDockerConfig(r io.Reader) (map[string]authCfg, error) {
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(r)
+	byteData := buf.Bytes()
+
+	confsWrapper := struct {
+		Auths map[string]authCfg `json:"auths"`
+	}{}
+	if err := json.Unmarshal(byteData, &confsWrapper); err == nil {
+		if len(confsWrapper.Auths) > 0 {
+			return confsWrapper.Auths, nil
+		}
+	}
+
+	var confs map[string]authCfg
+	if err := json.Unmarshal(byteData, &confs); err != nil {
+		return nil, err
+	}
+	return confs, nil
+}
+
 func runContainer(imageName string, command []string, user *user.User, homeDir, workDir string, persistHome bool) int {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -27,11 +58,34 @@ func runContainer(imageName string, command []string, user *user.User, homeDir, 
 		panic(err)
 	}
 
-	if !strings.Contains(imageName, "/") {
+	imgPullOpts := types.ImagePullOptions{}
+
+	if strings.Contains(imageName, "/") {
+		dkrCfgPath := filepath.Join(user.HomeDir, ".docker", "config.json")
+		if _, err := os.Stat(dkrCfgPath); err == nil {
+			dkrCfgFp, err := os.Open(dkrCfgPath)
+			if err != nil {
+				panic(err)
+			}
+			defer dkrCfgFp.Close()
+
+			auths, err := parseDockerConfig(dkrCfgFp)
+			if err == nil {
+				baseUrl := strings.Split(imageName, "/")[0]
+				for url, cfg := range auths {
+					if url == baseUrl {
+						imgPullOpts.RegistryAuth = cfg.Auth
+						break
+					}
+				}
+			}
+		}
+
+	} else {
 		imageName = "docker.io/library/" + imageName
 	}
 
-	reader, err := cli.ImagePull(ctx, imageName, types.ImagePullOptions{})
+	reader, err := cli.ImagePull(ctx, imageName, imgPullOpts)
 	if err != nil {
 		panic(err)
 	}
@@ -166,6 +220,7 @@ func main() {
 	var persistHome bool
 
 	app := &cli.App{
+		Usage: "Docker run as current user",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:        "work-dir",
@@ -187,11 +242,17 @@ func main() {
 			},
 		},
 		Action: func(c *cli.Context) error {
+			imageName := c.Args().First()
+			if imageName == "" {
+				cli.ShowAppHelp(c)
+				//fmt.Println("\nerror: missing image name")
+				return cli.Exit("\nerror: missing image name", 1)
+			}
+
 			fmt.Println("homeDir:", homeDir)
 			fmt.Println("workDir:", workDir)
 			fmt.Println("persistHome:", persistHome)
 
-			imageName := c.Args().First()
 			fmt.Println("imageName:", imageName)
 
 			cmd := c.Args().Tail()
