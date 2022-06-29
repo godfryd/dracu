@@ -18,7 +18,7 @@ end
 
 task :build => [GO] do
   Dir.chdir('src') do
-    sh "#{GO} build -v -race"
+    sh "#{GO} build -v -race -ldflags \"-X main.DracuVersion=#{DRACU_VER}\""
     sh "mv dracu .."
   end
 end
