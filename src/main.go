@@ -130,6 +130,17 @@ func copyToContainer(ctx context.Context, client *client.Client, cntrID string, 
 	return res
 }
 
+// Struct representing events returned from image pulling
+type pullEvent struct {
+    ID             string `json:"id"`
+    Status         string `json:"status"`
+    Error          string `json:"error,omitempty"`
+    Progress       string `json:"progress,omitempty"`
+    ProgressDetail struct {
+        Current int `json:"current"`
+        Total   int `json:"total"`
+    } `json:"progressDetail"`
+}
 
 func runContainer(imageName string, command []string, user *user.User, homeDir, workDir string, persistHome, volatileWork bool) int {
 	ctx := context.Background()
@@ -169,9 +180,22 @@ func runContainer(imageName string, command []string, user *user.User, homeDir, 
 	if err != nil {
 		panic(err)
 	}
-
 	defer reader.Close()
-	io.Copy(os.Stdout, reader)
+
+	var event *pullEvent
+	decoder := json.NewDecoder(reader)
+
+	for {
+		if err := decoder.Decode(&event); err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			panic(err)
+		}
+
+		fmt.Println(event.Status, event.Progress)
+        }
 
 	userStr := fmt.Sprintf("%s:%s", user.Uid, user.Gid)
 	fmt.Printf("user: %s\n", userStr)
