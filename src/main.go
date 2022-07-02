@@ -12,6 +12,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"time"
 
 	//"github.com/urfave/cli/v2"
 	flags "github.com/jessevdk/go-flags"
@@ -22,6 +23,8 @@ import (
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/docker/docker/pkg/archive"
+	"github.com/docker/docker/pkg/system"
 )
 
 var DracuVersion string
@@ -54,7 +57,81 @@ func parseDockerConfig(r io.Reader) (map[string]authCfg, error) {
 	return confs, nil
 }
 
-func runContainer(imageName string, command []string, user *user.User, homeDir, workDir string, persistHome bool) int {
+
+func resolveLocalPath(localPath string) (absPath string, err error) {
+	if absPath, err = filepath.Abs(localPath); err != nil {
+		return
+	}
+	return archive.PreserveTrailingDotOrSeparator(absPath, localPath, filepath.Separator), nil
+}
+
+func copyToContainer(ctx context.Context, client *client.Client, cntrID string, srcPath, dstPath string) (err error) {
+	// Get an absolute source path.
+	srcPath, err = resolveLocalPath(srcPath)
+	if err != nil {
+		return err
+	}
+
+	// Prepare destination copy info by stat-ing the container path.
+	dstInfo := archive.CopyInfo{Path: dstPath}
+	dstStat, err := client.ContainerStatPath(ctx, cntrID, dstPath)
+
+	// If the destination is a symbolic link, we should evaluate it.
+	if err == nil && dstStat.Mode&os.ModeSymlink != 0 {
+		linkTarget := dstStat.LinkTarget
+		if !system.IsAbs(linkTarget) {
+			// Join with the parent directory.
+			dstParent, _ := archive.SplitPathDirEntry(dstPath)
+			linkTarget = filepath.Join(dstParent, linkTarget)
+		}
+
+		dstInfo.Path = linkTarget
+		dstStat, err = client.ContainerStatPath(ctx, cntrID, linkTarget)
+	}
+
+	// Ignore any error and assume that the parent directory of the destination
+	// path exists, in which case the copy may still succeed. If there is any
+	// type of conflict (e.g., non-directory overwriting an existing directory
+	// or vice versa) the extraction will fail. If the destination simply did
+	// not exist, but the parent directory does, the extraction will still
+	// succeed.
+	if err == nil {
+		dstInfo.Exists, dstInfo.IsDir = true, dstStat.Mode.IsDir()
+	}
+
+	// Prepare source copy info.
+	srcInfo, err := archive.CopyInfoSourcePath(srcPath, false)
+	if err != nil {
+		return err
+	}
+
+	srcArchive, err := archive.TarResource(srcInfo)
+	if err != nil {
+		return err
+	}
+	defer srcArchive.Close()
+
+	dstInfo.Exists = false
+
+	// destination that the user specified.
+	resolvedDstPath, preparedArchive, err := archive.PrepareArchiveCopy(srcArchive, srcInfo, dstInfo)
+	if err != nil {
+		return err
+	}
+	defer preparedArchive.Close()
+
+	options := types.CopyToContainerOptions{
+		AllowOverwriteDirWithFile: false,
+		CopyUIDGID:                false,
+	}
+
+	res := client.CopyToContainer(ctx, cntrID, resolvedDstPath, preparedArchive, options)
+
+	return res
+}
+
+
+func runContainer(imageName string, command []string, user *user.User, homeDir, workDir string, persistHome, volatileWork bool) int {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -105,18 +182,42 @@ func runContainer(imageName string, command []string, user *user.User, homeDir, 
 	}
 	destWorkDir := filepath.Join(user.HomeDir, "work")
 
-	mounts := []mount.Mount{
-		{
+	mounts := []mount.Mount{}
+
+	var workVol types.Volume
+	if !volatileWork {
+		mounts = append(mounts, mount.Mount{
 			Type:   mount.TypeBind,
 			Source: workDir,
 			Target: destWorkDir,
-		},
+		})
+	} else {
+		volOwner := fmt.Sprintf("uid=%s,gid=%s", user.Uid, user.Gid)
+		workVol, err = cli.VolumeCreate(ctx, volume.VolumeCreateBody{
+			Driver: "local",
+			DriverOpts: map[string]string{
+				"type":   "tmpfs",
+				"device": "tmpfs",
+				"o":      volOwner,
+			},
+		})
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Printf("work volumen created: %s\n", workVol.Name)
+
+		mounts = append(mounts, mount.Mount{
+			Type:   mount.TypeVolume,
+			Source: workVol.Name,
+			Target: destWorkDir,
+		})
 	}
 
-	var vol types.Volume
+	var homeVol types.Volume
 	if homeDir == "" {
 		volOwner := fmt.Sprintf("uid=%s,gid=%s", user.Uid, user.Gid)
-		vol, err = cli.VolumeCreate(ctx, volume.VolumeCreateBody{
+		homeVol, err = cli.VolumeCreate(ctx, volume.VolumeCreateBody{
 			//Name:   "dkrme-home",
 			Driver: "local",
 			DriverOpts: map[string]string{
@@ -129,11 +230,11 @@ func runContainer(imageName string, command []string, user *user.User, homeDir, 
 			panic(err)
 		}
 
-		fmt.Printf("home volumen created: %s\n", vol.Name)
+		fmt.Printf("home volumen created: %s\n", homeVol.Name)
 
 		mounts = append(mounts, mount.Mount{
 			Type:   mount.TypeVolume,
-			Source: vol.Name,
+			Source: homeVol.Name,
 			Target: user.HomeDir,
 		})
 	} else {
@@ -152,7 +253,7 @@ func runContainer(imageName string, command []string, user *user.User, homeDir, 
 	resp, err := cli.ContainerCreate(ctx,
 		&container.Config{
 			Image:      imageName,
-			Cmd:        command,
+			Cmd:        []string{"sleep", "100000"},
 			Tty:        false,
 			User:       userStr,
 			WorkingDir: destWorkDir,
@@ -173,6 +274,38 @@ func runContainer(imageName string, command []string, user *user.User, homeDir, 
 		panic(err)
 	}
 
+	if volatileWork {
+		fmt.Printf("copy workdir from %s to %s\n", workDir, destWorkDir)
+		err = copyToContainer(ctx, cli, resp.ID, workDir, destWorkDir)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// RUN COMMAND
+	idResponse, err := cli.ContainerExecCreate(ctx, resp.ID,types.ExecConfig{
+		User: user.Uid,
+		WorkingDir: destWorkDir,
+		Cmd: command,
+		Tty:true,
+		AttachStderr:true,
+		AttachStdout:true,
+		AttachStdin:true,
+		Detach:true,
+	})
+	attach, err := cli.ContainerExecAttach(ctx, idResponse.ID, types.ExecStartCheck{})
+	if err != nil {
+		panic(err)
+	}
+	defer attach.Close()
+	stdcopy.StdCopy(os.Stdout, os.Stderr, attach.Reader)
+
+	timeout := time.Duration(10)
+	if err := cli.ContainerStop(ctx, resp.ID, &timeout); err != nil {
+		fmt.Println("error when stop container ", err)
+	}
+
+	// WAIT FOR FINISH
 	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
 	var status container.ContainerWaitOKBody
 	select {
@@ -186,13 +319,6 @@ func runContainer(imageName string, command []string, user *user.User, homeDir, 
 		}
 	}
 
-	out, err := cli.ContainerLogs(ctx, resp.ID, types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
-	if err != nil {
-		panic(err)
-	}
-
-	stdcopy.StdCopy(os.Stdout, os.Stderr, out)
-
 	rmOpts := types.ContainerRemoveOptions{
 		RemoveVolumes: true,
 		Force:         true,
@@ -202,15 +328,23 @@ func runContainer(imageName string, command []string, user *user.User, homeDir, 
 		panic(err)
 	}
 
-	if vol.Name != "" {
+	if homeVol.Name != "" {
 		if persistHome {
-			fmt.Printf("home volume left: %v\n", vol.Name)
+			fmt.Printf("home volume left: %v\n", homeVol.Name)
 		} else {
-			fmt.Printf("deleting home volume: %v\n", vol.Name)
-			err = cli.VolumeRemove(ctx, vol.Name, true)
+			fmt.Printf("deleting home volume: %v\n", homeVol.Name)
+			err = cli.VolumeRemove(ctx, homeVol.Name, true)
 			if err != nil {
 				panic(err)
 			}
+		}
+	}
+
+	if workVol.Name != "" {
+		fmt.Printf("deleting work volume: %v\n", workVol.Name)
+		err = cli.VolumeRemove(ctx, workVol.Name, true)
+		if err != nil {
+			panic(err)
 		}
 	}
 
@@ -223,6 +357,7 @@ type AppOpts struct {
 	WorkDir     string `long:"work-dir" description:"directory mounted to the container and used as a current working directory" default:"."`
 	HomeDir     string `long:"home-dir" description:"directory mounted to the container and used as a home directory for current user"`
 	PersistHome bool   `long:"persist-home" description:"if home-dir is not provided and this flag is provided then non-persistent volumen is used for home directory"`
+	VolatileWork bool  `long:"volatile-work" description:"if enabled then any changes made to work-dir inside a containerare not copied back to the host"`
 	Args        struct {
 		ImageName string    `positional-arg-name:"<docker-image-name>"`
 		Rest      []string  `positional-arg-name:"<command-with-args>"`
@@ -248,7 +383,7 @@ func startApp(opts AppOpts) int {
 	}
 	fmt.Printf("currentUser %v\n", currentUser)
 
-	exitCode := runContainer(imageName, cmd, currentUser, opts.HomeDir, opts.WorkDir, opts.PersistHome)
+	exitCode := runContainer(imageName, cmd, currentUser, opts.HomeDir, opts.WorkDir, opts.PersistHome, opts.VolatileWork)
 
 	fmt.Sprintf("command exited with %d exit code", exitCode)
 
